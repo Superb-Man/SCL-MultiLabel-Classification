@@ -155,9 +155,9 @@ class MultiSupConLoss(nn.Module):
 
         return loss
     
-class MultiLabelSupConLoss(nn.Module):
+class MultiSupConLoss2(nn.Module):
     def __init__(self, temperature=0.07, similarity_threshold=0.5):
-        super(MultiLabelSupConLoss, self).__init__()
+        super(MultiSupConLoss2, self).__init__()
         self.temperature = temperature
         self.similarity_threshold = similarity_threshold
 
@@ -191,8 +191,8 @@ class MultiLabelSupConLoss(nn.Module):
         # Mask self-contrast cases
         logits_mask = torch.ones_like(logits)
         idx = torch.arange(batch_size * anchor_count, device=device)
-        logits_mask = logits_mask.scatter(1, idx.view(-1, 1), 0)  # Set diagonal (self-similarity) to 0
-
+        logits_mask = logits_mask.scatter(1, idx.view(-1, 1), 0) 
+        
         positive_mask = positive_mask.repeat(anchor_count, anchor_count) * logits_mask
         negative_mask = negative_mask.repeat(anchor_count, anchor_count) * logits_mask
 
@@ -217,10 +217,6 @@ class MultiLabelSupConLoss(nn.Module):
         return loss
 
 
-
-
-
-
 def main():
     torch.manual_seed(0)
     labels = torch.tensor([
@@ -239,20 +235,23 @@ def main():
         [[0.0, 0.9, 0.1, 0.0], [0.2, 0.8, 0.2, -0.1]],
     ])
     multi_label_loss = MultiSupConLoss()
-    multi_label_loss2 = MultiLabelSupConLoss()
+    multi_label_loss2 = MultiSupConLoss2()
+    # multi_label_loss3 = MultiSupConLoss3()
+    # multi_label_loss4 = MultiLabelSupConLoss()
 
 
     multi_label_loss = multi_label_loss(features, labels)
     multi_label_loss2 = multi_label_loss2(features, labels)
+    # multi_label_loss3 = multi_label_loss3(features, labels)
+    # multi_label_loss4 = multi_label_loss4(features, labels)
 
-    # loss = LabelWeightedConLoss()
-    # loss = loss(features, labels)
 
     
     print("Computed Losses:")
     print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss.item():.6f}")
     print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss2.item():.6f}")
-    # print(f"Label Weighted Contrastive Loss: {loss.item():.6f}")
+    # print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss3.item():.6f}")
+    # print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss4.item():.6f}")
 
 if __name__ == "__main__":
     main()
