@@ -1,20 +1,46 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import numpy as np
+
+torch.manual_seed(0)
+
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, embed_dim=768):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+
+        self.proj = nn.Conv2d(
+            in_channels=3,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, (
+            f"Image dimensions ({H}, {W}) must be divisible by the patch size ({self.patch_size})."
+        )
+
+        # Generate patch embeddings and flatten
+        x = self.proj(x)  # Shape: (B, embed_dim, num_patches_height, num_patches_width)
+        x = x.flatten(2).transpose(1, 2)  # Shape: (B, num_patches, embed_dim)
+        return x
 
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
-        super(MultiHeadSelfAttention, self).__init__()
+        super().__init__()
         assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by the number of heads"
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
         self.proj = nn.Linear(embed_dim, embed_dim)
-
-        self.scale = self.head_dim ** -0.5
 
     def forward(self, x):
         B, N, C = x.shape
@@ -28,13 +54,14 @@ class MultiHeadSelfAttention(nn.Module):
         return self.proj(out)
 
 
+
 class MLP(nn.Module):
     def __init__(self, embed_dim, mlp_ratio, dropout):
-        super(MLP, self).__init__()
+        super().__init__()
         hidden_dim = int(embed_dim * mlp_ratio)
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, embed_dim)
         self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -46,9 +73,10 @@ class MLP(nn.Module):
         return x
 
 
+
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_ratio, dropout):
-        super(TransformerBlock, self).__init__()
+        super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = MultiHeadSelfAttention(embed_dim, num_heads)
         self.norm2 = nn.LayerNorm(embed_dim)
@@ -59,16 +87,13 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-
 class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, dropout=0.1):
-        super(VisionTransformer, self).__init__()
-        self.patch_size = patch_size
-        num_patches = (img_size // patch_size) ** 2
+        super().__init__()
+        self.patch_embed = PatchEmbedding(img_size, patch_size, embed_dim)
+        self.num_patches = self.patch_embed.num_patches
 
-        self.embed_dim = embed_dim
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dropout = nn.Dropout(dropout)
 
@@ -77,9 +102,9 @@ class VisionTransformer(nn.Module):
         ])
         self.norm = nn.LayerNorm(embed_dim)
 
-        self._init_weights()
+        self._initialize_weights()
 
-    def _init_weights(self):
+    def _initialize_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         for m in self.modules():
@@ -93,7 +118,7 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x):
         B = x.shape[0]
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        x = self.patch_embed(x)
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
@@ -103,20 +128,13 @@ class VisionTransformer(nn.Module):
             x = block(x)
 
         x = self.norm(x)
-        return x[:, 0]  # Return the CLS token embedding
-
+        return x[:, 0]  # CLS token
 
 class SupConViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, dropout=0.1, proj_dim=128, num_classes=1000):
-        super(SupConViT, self).__init__()
+        super().__init__()
         self.encoder = VisionTransformer(
-            img_size=img_size,
-            patch_size=patch_size,
-            embed_dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            dropout=dropout
+            img_size, patch_size, embed_dim, depth, num_heads, mlp_ratio, dropout
         )
 
         self.projection_head = nn.Sequential(
@@ -131,6 +149,10 @@ class SupConViT(nn.Module):
             nn.Sigmoid()
         )
 
+        # Freeze classification head
+        for param in self.classification_head.parameters():
+            param.requires_grad = False
+
     def forward(self, x, train_mode=True):
         features = self.encoder(x)
         if train_mode:
@@ -141,9 +163,14 @@ class SupConViT(nn.Module):
             return logits
 
 
-
 if __name__ == '__main__':
+    # Instantiate the model
     model = SupConViT()
-    x = torch.randn(2, 3, 224, 224)
+
+    # Load sample input data
+    x = np.load('x.npy')
+    x = torch.from_numpy(x).float()
+
+    # Forward pass
     out = model(x)
     print(out)

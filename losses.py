@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 """
     Modifying the Supervised Contrastive Loss for Multi-Label Data
@@ -211,11 +212,166 @@ class MultiSupConLoss2(nn.Module):
             sample_loss = -torch.log(torch.exp(pos_logits).sum() / (torch.exp(pos_logits).sum() + torch.exp(neg_logits).sum() + 1e-8))
             losses.append(sample_loss)
 
-        # Average loss across batch
         loss = torch.stack(losses).mean() if losses else torch.tensor(0.0, requires_grad=True, device=device)
 
         return loss
+    
 
+class ClassWiseSupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(ClassWiseSupConLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        device = features.device
+
+        if len(features.shape) < 3:
+            raise ValueError("`features` needs to be [batch_size, n_views, feature_dim].")
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # [batch_size * n_views, feature_dim]
+
+        losses = []
+        for class_idx in range(labels.shape[1]):  # Iterate over classes
+            class_mask = labels[:, class_idx]  # [batch_size]
+            positive_indices = torch.where(class_mask == 1)[0]
+
+            if len(positive_indices) < 2:
+                continue 
+
+            # Class-specific features
+            class_features = contrast_feature[positive_indices.repeat_interleave(contrast_count)]
+            dot_similarities = torch.matmul(class_features, class_features.T) / self.temperature  # Cosine similarity
+
+            logits_max, _ = torch.max(dot_similarities, dim=1, keepdim=True)
+            logits = dot_similarities - logits_max.detach()
+
+            logits_mask = torch.ones_like(logits)
+            idx = torch.arange(len(class_features), device=device)
+            logits_mask.scatter_(1, idx.view(-1, 1), 0)
+
+            exp_logits = torch.exp(logits) * logits_mask
+            log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+
+            mean_log_prob_pos = log_prob.mean()
+            losses.append(-mean_log_prob_pos)
+
+        loss = torch.stack(losses).mean() if losses else torch.tensor(0.0, requires_grad=True, device=device)
+        return loss
+
+
+class LabelMaskingSupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(LabelMaskingSupConLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        device = features.device
+
+        if len(features.shape) < 3:
+            raise ValueError("`features` needs to be [batch_size, n_views, feature_dim].")
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # [batch_size * n_views, feature_dim]
+
+        # Compute label similarity mask
+        label_sim = torch.matmul(labels.float(), labels.T.float())  # [batch_size, batch_size]
+        positive_mask = (label_sim > 0).float().to(device)
+        positive_mask = positive_mask.repeat(contrast_count, contrast_count)
+
+        # Compute logits
+        dot_similarities = torch.matmul(contrast_feature, contrast_feature.T) / self.temperature  # [batch_size * n_views, batch_size * n_views]
+
+        logits_max, _ = torch.max(dot_similarities, dim=1, keepdim=True)
+        logits = dot_similarities - logits_max.detach()
+
+        logits_mask = torch.ones_like(logits)
+        idx = torch.arange(batch_size * contrast_count, device=device)
+        logits_mask.scatter_(1, idx.view(-1, 1), 0)  # Mask self-comparisons
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+
+        mean_log_prob_pos = (positive_mask * log_prob).sum(1) / (positive_mask.sum(1) + 1e-8)
+        loss = -(mean_log_prob_pos).mean()
+
+        return loss
+
+
+
+class MultiLabelContrastiveLoss(nn.Module):
+    def __init__(self, alpha=1.0, temperature=0.07, reduction='mean', beta=1.0):
+        super(MultiLabelContrastiveLoss, self).__init__()
+        self.alpha = alpha
+        self.temperature = temperature
+        self.reduction = reduction
+        self.beta = beta
+
+    def forward(self, features, labels):
+        device = features.device
+
+        if len(features.shape) < 3:
+            raise ValueError("`features` should have at least 3 dimensions [batch_size, n_views, feature_dim].")
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # [batch_size * n_views, feature_dim]
+
+        # Compute label similarities using Jaccard similarity
+        intersection = torch.matmul(labels, labels.T).float()
+        union = labels.sum(dim=1, keepdim=True) + labels.sum(dim=1, keepdim=True).T - intersection
+        similarity = intersection / (union + 1e-8)
+
+        # Weighting function f(y_i, y_j)
+        weight_function = (intersection / (union + 1e-8)) ** self.beta
+
+        expanded_similarity = similarity.repeat_interleave(contrast_count, dim=0).repeat_interleave(contrast_count, dim=1)
+        expanded_weights = weight_function.repeat_interleave(contrast_count, dim=0).repeat_interleave(contrast_count, dim=1)
+
+        # Create positive and negative masks
+        positive_mask = (expanded_similarity > 0).float().to(device)  # Positive pairs
+        negative_mask = 1 - positive_mask  # Negative pairs
+
+        dot_similarities = torch.matmul(contrast_feature, contrast_feature.T) / self.temperature
+
+        # Mask self-contrast
+        logits_max, _ = torch.max(dot_similarities, dim=1, keepdim=True)
+        logits = dot_similarities - logits_max.detach()
+        logits_mask = torch.ones_like(logits)
+        idx = torch.arange(batch_size * contrast_count, device=device)
+        logits_mask.scatter_(1, idx.view(-1, 1), 0)
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+
+        # Compute positive and negative contributions with weights
+        positive_log_prob = (positive_mask * expanded_weights * log_prob).sum(1) / (positive_mask.sum(1) + 1e-8)
+        negative_log_prob = (negative_mask * log_prob).sum(1) / (negative_mask.sum(1) + 1e-8)
+
+        # Combine with weighting factor
+        loss = -self.alpha * positive_log_prob - (1 - self.alpha) * negative_log_prob
+
+        regularization = self._compute_regularization(contrast_feature)
+        loss += regularization
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+    def _compute_regularization(self, embeddings):
+        reg_loss = torch.mean(torch.norm(embeddings, dim=1))
+        return reg_loss
 
 def main():
     torch.manual_seed(0)
@@ -238,12 +394,18 @@ def main():
     multi_label_loss2 = MultiSupConLoss2()
     # multi_label_loss3 = MultiSupConLoss3()
     # multi_label_loss4 = MultiLabelSupConLoss()
+    multi_label_loss5 = ClassWiseSupConLoss()
+    multi_label_loss6 = LabelMaskingSupConLoss()
+    multi_label_loss7 = MultiLabelContrastiveLoss()
 
 
     multi_label_loss = multi_label_loss(features, labels)
     multi_label_loss2 = multi_label_loss2(features, labels)
     # multi_label_loss3 = multi_label_loss3(features, labels)
     # multi_label_loss4 = multi_label_loss4(features, labels)
+    multi_label_loss5 = multi_label_loss5(features, labels)
+    multi_label_loss6 = multi_label_loss6(features, labels)
+    multi_label_loss7 = multi_label_loss7(features, labels)
 
 
     
@@ -252,6 +414,9 @@ def main():
     print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss2.item():.6f}")
     # print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss3.item():.6f}")
     # print(f"Multi-Label Supervised Contrastive Loss: {multi_label_loss4.item():.6f}")
+    print(f"Class-Wise Supervised Contrastive Loss: {multi_label_loss5.item():.6f}")
+    print(f"Label-Masking Supervised Contrastive Loss: {multi_label_loss6.item():.6f}")
+    print(f"Multi-Label Contrastive Loss: {multi_label_loss7.item():.6f}")
 
 if __name__ == "__main__":
     main()

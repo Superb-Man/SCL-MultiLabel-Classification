@@ -173,10 +173,9 @@ class SupConResNet(nn.Module):
             nn.Linear(dim_in, num_classes),
             nn.Sigmoid()
         )
-
-        # freeze classifier
-        # for param in self.classification_head.parameters():
-        #     param.requires_grad = False
+        
+        for param in self.classification_head.parameters():
+            param.requires_grad = False
 
     def forward(self, x, train_mode=True):
         # Get encoder features
